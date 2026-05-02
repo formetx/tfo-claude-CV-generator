@@ -7,7 +7,7 @@ description: "workflow de candidature automatique dans LinkedIn — architecture
 
 
 # Agent de candidature automatique — Thierry Formentini
-# VERSION 6 — deux flux selon type d'offre + détection automatique page courante
+# VERSION 7 — génération CV paramétrique + auto-calibration 2 pages
 
 ## ARCHITECTURE GÉNÉRALE
 
@@ -228,6 +228,95 @@ Le prompt système du Project prend le relais et exécute :
 Les fichiers sont disponibles en téléchargement dans la réponse.
 
 Noter le bloc `===DECISION===` pour Phase C si soumission manuelle souhaitée ensuite.
+
+---
+
+## GÉNÉRATION CV — PROTOCOLE OBLIGATOIRE (Phase B, Étape 4)
+
+### Fichier source
+
+Le CV est généré via `/mnt/project/generate_cv.py` (copie de travail dans `/home/claude/`).
+**Ne jamais écrire un script from scratch.** Toujours partir de ce fichier.
+
+```bash
+cp /mnt/project/generate_cv.py /home/claude/generate_cv_[ENTREPRISE].py
+```
+
+### Architecture du script
+
+Le script expose :
+- `CVData` — structure de données (tagline, profile, expertise, competencies, jobs, education)
+- `JobEntry` / `JobSection` / `BulletItem(text, priority)` — données par poste
+- `auto_calibrate(data)` — ajuste le contenu pour tenir en 2 pages exactes
+- `build_pdf(data, output_path)` — génère le PDF
+- `VARIANTS` — dict de variantes pré-définies (BASE, HASCO, …)
+
+### Règle de priorité des bullets
+
+Chaque bullet porte une priorité 1/2/3 :
+- **1 = must-keep** — jamais retiré (chiffre d'impact, compétence centrale pour le poste)
+- **2 = important** — retiré en dernier recours seulement
+- **3 = nice-to-have** — retiré en premier si le contenu dépasse 2 pages
+
+L'`auto_calibrate` retire les p=3 en partant de la fin, puis les p=2 si nécessaire.
+**Règle absolue : minimum 1 bullet par poste, jamais de poste supprimé.**
+
+### Workflow de création d'une variante
+
+1. **Copier** le script source dans `/home/claude/`
+2. **Créer** un `CVData` variant en appelant `_make_variant(...)` :
+   - Définir `tagline`, `profile`, `expertise`, `competencies` ciblés sur l'offre
+   - Définir `job_overrides` : dict `{index: JobEntry}` pour les postes à réécrire
+   - Définir `job_order` : liste d'indices pour réordonner selon la pertinence
+   - Les postes les plus pertinents pour l'offre viennent **en premier**
+3. **Appeler** `build_pdf(variant_data, output_path)` — l'auto-calibration s'exécute automatiquement
+4. **Vérifier** le nombre de pages avec `pypdf` :
+
+```python
+from pypdf import PdfReader
+r = PdfReader(output_path)
+assert len(r.pages) == 2, f"ERREUR : {len(r.pages)} pages générées"
+```
+
+5. Si assertion échoue → **ne pas livrer**. Diagnostiquer avec :
+
+```python
+from generate_cv_[ENTREPRISE] import variant_data, _estimate_height, CONTENT_H
+h = _estimate_height(variant_data)
+print(f"Hauteur estimée : {h:.0f} / {2*CONTENT_H:.0f} pts ({h/(2*CONTENT_H)*100:.1f}%)")
+```
+
+### Règles de contenu des variantes
+
+**Ce qui change par variante :**
+- `tagline` — reformulée pour résonner avec le titre du poste
+- `profile` (sidebar) — 6 lignes max, accent sur les dimensions clés de l'offre
+- `expertise` + `competencies` (sidebar) — réordonnées, termes ATS de l'offre intégrés
+- `job_order` — poste le plus pertinent en position 0
+- `job_overrides` — bullets enrichis / reformulés pour les 2-3 postes les plus pertinents
+
+**Ce qui ne change jamais :**
+- Noms d'employeurs, intitulés de postes, dates, chiffres (budgets, %)
+- Coordonnées, langues, formation
+- Aucun poste n'est supprimé (continuité chronologique pour les ATS)
+
+**Niveaux de détail par pertinence :**
+- Poste central pour l'offre → 6-8 bullets répartis en 2-3 sous-sections
+- Poste partiellement pertinent → 3-5 bullets, 1-2 sous-sections
+- Poste non pertinent → 2-3 bullets priority=1 seulement, pas de sous-section
+
+### Calibration manuelle si auto_calibrate insuffisant
+
+Si après `auto_calibrate` le CV fait encore 3 pages :
+1. Identifier les postes en page 2 avec le plus de bullets p=3
+2. Réduire manuellement à 2 bullets les postes les moins pertinents
+3. Ne jamais toucher aux bullets p=1 des postes centraux
+
+Si le CV fait 2 pages mais page 2 < 50% remplie :
+→ Acceptable si le contenu est dense en page 1 (sous-sections, bullets longs)
+→ Ne pas ajouter du contenu inventé pour "remplir"
+
+---
 
 ### B3 — Fin de phase
 
