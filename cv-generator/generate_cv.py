@@ -427,6 +427,9 @@ class LetterData:
     subject: str              # objet de la lettre
     body_paragraphs: list[str]# paragraphes du corps (texte brut)
     city_date: str            # ex. "Wuppertal, 2. Mai 2026"
+    salutation: str = 'Sehr geehrte Damen und Herren,'
+    closing: str = 'Ich freue mich \xfcber die M\xf6glichkeit eines pers\xf6nlichen Gespr\xe4chs.'
+    valediction: str = 'Mit freundlichen Gr\xfc\xdfen'
 
 def build_letter_pdf(letter: LetterData, output_path: str) -> str:
     """Génère une lettre de motivation PDF — style cadre dirigeant, aéré et professionnel."""
@@ -510,18 +513,16 @@ def build_letter_pdf(letter: LetterData, output_path: str) -> str:
     story.append(Paragraph(letter.subject, L_SUBJ))
 
     # Salutation
-    story.append(Paragraph('Sehr geehrte Damen und Herren,', L_SAL))
+    story.append(Paragraph(letter.salutation, L_SAL))
 
     # Corps — chaque paragraphe séparé
     for para in letter.body_paragraphs:
         story.append(Paragraph(para, L_BODY))
 
     # Closing + signature
-    story.append(Paragraph(
-        'Ich freue mich \xfcber die M\xf6glichkeit eines pers\xf6nlichen Gespr\xe4chs.',
-        L_CLOSE))
+    story.append(Paragraph(letter.closing, L_CLOSE))
     story.append(Spacer(1, 4*mm))
-    story.append(Paragraph('Mit freundlichen Gr\xfc\xdfen', L_CGEND))
+    story.append(Paragraph(letter.valediction, L_CGEND))
     story.append(Paragraph('Thierry Formentini', L_SIG))
 
     doc.build(story, onFirstPage=draw_letter_page, onLaterPages=draw_letter_page)
