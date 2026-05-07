@@ -318,13 +318,46 @@ def json_to_cvdata(d: dict) -> CVData:
     )
 
 
+def _detect_lang(text: str) -> str:
+    """Détecte la langue dominante sur la base de mots fréquents (DE/EN/FR)."""
+    text_lower = text.lower()
+    de = sum(text_lower.count(w) for w in [' die ', ' der ', ' und ', ' für ', ' mit ', ' ich ', ' wir '])
+    en = sum(text_lower.count(w) for w in [' the ', ' and ', ' for ', ' with ', ' our ', ' your ', ' have '])
+    fr = sum(text_lower.count(w) for w in [' les ', ' des ', ' pour ', ' avec ', ' nous ', ' vous ', ' mon '])
+    scores = {'de': de, 'en': en, 'fr': fr}
+    return max(scores, key=scores.get)
+
+_LETTER_STRINGS = {
+    'de': {
+        'salutation':  'Sehr geehrte Damen und Herren,',
+        'closing':     'Ich freue mich \xfcber die M\xf6glichkeit eines pers\xf6nlichen Gespr\xe4chs.',
+        'valediction': 'Mit freundlichen Gr\xfc\xdfen',
+    },
+    'en': {
+        'salutation':  'Dear Hiring Team,',
+        'closing':     'I would welcome the opportunity for a personal conversation.',
+        'valediction': 'Kind regards,',
+    },
+    'fr': {
+        'salutation':  'Madame, Monsieur,',
+        'closing':     'Je serais ravi\xe9 de pouvoir vous rencontrer pour un entretien.',
+        'valediction': 'Cordialement,',
+    },
+}
+
 def json_to_letterdata(d: dict, letter_d: dict) -> LetterData:
+    body = ' '.join(letter_d['body_paragraphs'])
+    lang = _detect_lang(body)
+    strings = _LETTER_STRINGS.get(lang, _LETTER_STRINGS['de'])
     return LetterData(
         recipient_name=d.get('company_slug', ''),
         recipient_addr=letter_d['recipient_addr'],
         subject=letter_d['subject'],
         body_paragraphs=letter_d['body_paragraphs'],
         city_date=letter_d['city_date'],
+        salutation=strings['salutation'],
+        closing=strings['closing'],
+        valediction=strings['valediction'],
     )
 
 
