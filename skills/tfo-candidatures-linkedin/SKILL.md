@@ -3,456 +3,292 @@ name: tfo-candidatures-linkedin
 description: "workflow de candidature automatique dans LinkedIn — architecture en phases séparées"
 ---
 
-
-
-
 # Agent de candidature automatique — Thierry Formentini
-# VERSION 7 — génération CV paramétrique + auto-calibration 2 pages
+# VERSION 8 — ATS-optimized
 
-## ARCHITECTURE GÉNÉRALE
+## ARCHITECTURE
 
-Le workflow est découpé en **phases indépendantes**.
-**Chaque phase DOIT être lancée dans une nouvelle conversation séparée.**
-Raison : chaque conversation a une limite d'appels d'outils. Travailler par phase évite le blocage.
-
-### RÈGLE FONDAMENTALE — DEUX FLUX SELON TYPE D'OFFRE
+Phases indépendantes — chaque phase dans une nouvelle conversation.
 
 ```
-Offre EASY APPLY     → Phase C directement (CV LinkedIn actif, sans customisation)
-Offre NON EASY APPLY → Phase B (analyse + docs adaptés) PUIS Phase C (soumission)
+EASY APPLY     → Phase C directement
+NON EASY APPLY → Phase B puis Phase C
 ```
 
-- `/candidatures-linkedin phase-a` → Extraction batch + routage selon type d'offre
-- `/candidatures-linkedin phase-b [jobId]` → Analyse CV + génération documents (offres non Easy Apply uniquement)
+- `/candidatures-linkedin` ou `phase-a` → Extraction batch + routage
+- `/candidatures-linkedin phase-b [jobId]` → Analyse + docs adaptés (non Easy Apply uniquement)
 - `/candidatures-linkedin phase-c [jobId]` → Soumission + Google Sheets
-
-Si l'utilisateur tape juste `/candidatures-linkedin` sans argument → lancer Phase A automatiquement.
-
----
 
 ## RÈGLES GLOBALES D'ÉCONOMIE D'APPELS
 
-1. **Toujours utiliser `browser_batch`** pour grouper : navigate + wait en 1 appel.
-2. **Jamais de screenshot intermédiaire** sauf si indispensable pour décider de l'étape suivante.
-3. **Préférer `get_page_text` ou JS** à un screenshot quand le visuel n'apporte rien.
-4. **Un seul `tabs_context_mcp`** par phase, au tout début.
-5. **Grouper scroll + wait + JS** en un seul `browser_batch` quand c'est possible.
+1. Toujours `browser_batch` pour grouper navigate + wait.
+2. Pas de screenshot intermédiaire sauf si indispensable.
+3. Préférer `get_page_text` ou JS au screenshot.
+4. Un seul `tabs_context_mcp` par phase, au début.
+5. Grouper scroll + wait + JS en un seul `browser_batch`.
 
 ---
 
-## PHASE A — Extraction batch + détection + routage
+## PHASE A — Extraction batch + routage
 
-**⚠️ NOUVELLE SESSION OBLIGATOIRE — ouvre une nouvelle conversation avant de lancer Phase A.**
-
-**Objectif : identifier toutes les offres nominatives, détecter leur type, et router vers le bon flux.**
-**Budget cible : ≤ 15 appels d'outils pour toute la phase.**
-
-### A1 — Init (1 appel)
+### A1 — Init
 
 ```
 tabs_context_mcp(createIfEmpty=true)
 ```
 
-**Règle de démarrage — IMPORTANT :**
-
-- **Par défaut** (aucun flag) : exécuter d'abord le JS de détection suivant pour vérifier si la page courante contient des offres d'emploi :
+Par défaut : vérifier si page courante contient des offres :
 
 ```javascript
 const hasJobs = document.querySelectorAll('a[href*="/jobs/view/"]').length > 0;
 const url = window.location.href;
-const isJobsPage = /linkedin\.com\/(notifications|jobs)/.test(url);
-JSON.stringify({ hasJobs, isJobsPage, url: url.slice(0, 80) });
+JSON.stringify({ hasJobs, url: url.slice(0, 80) });
 ```
 
-**Règle de décision :**
-- Si `hasJobs = true` → page valide, continuer vers A2 directement.
-- Si `hasJobs = false` OU page vide OU URL non-LinkedIn → naviguer vers les notifications :
+- `hasJobs = true` → continuer vers A2.
+- `hasJobs = false` OU flag `-navig` → naviguer :
 
 ```
-browser_batch([
-  navigate(url="https://www.linkedin.com/notifications/?filter=jobs_all"),
-  wait(3s)
-])
+browser_batch([navigate(url="https://www.linkedin.com/notifications/?filter=jobs_all"), wait(3s)])
 ```
 
-Puis continuer avec A2.
-
-- **Flag `-navig`** (l'utilisateur a tapé `/candidatures-linkedin phase-a -navig`) : naviguer directement vers les notifications sans vérification préalable :
+### A2 — Scroll + extraction JS
 
 ```
-browser_batch([
-  navigate(url="https://www.linkedin.com/notifications/?filter=jobs_all"),
-  wait(3s)
-])
+browser_batch([scroll(down,10), wait(1s), scroll(down,10), wait(1s), scroll(down,10), wait(2s)])
 ```
-
-Puis continuer avec A2.
-
-### A2 — Scroll complet + extraction JS (2 appels)
-
-```
-browser_batch([
-  scroll(down, 10), wait(1s),
-  scroll(down, 10), wait(1s),
-  scroll(down, 10), wait(2s)
-])
-```
-
-Puis **un seul appel JS** pour tout extraire :
 
 ```javascript
 const notifications = [];
 document.querySelectorAll('[data-urn], li, .nt-card').forEach(el => {
   const text = el.innerText || '';
-  const isGeneric = /Neue Jobangebote/i.test(text);
-  if (isGeneric) return;
-  const links = Array.from(el.querySelectorAll('a[href]'));
-  links.forEach(a => {
+  if (/Neue Jobangebote/i.test(text)) return;
+  Array.from(el.querySelectorAll('a[href]')).forEach(a => {
     const m = a.href.match(/\/jobs\/view\/(\d+)/);
     if (m) notifications.push({ jobId: m[1], snippet: text.slice(0, 120).replace(/\n/g,' ') });
   });
 });
 const seen = new Set();
-const unique = notifications.filter(n => { if(seen.has(n.jobId)) return false; seen.add(n.jobId); return true; });
-JSON.stringify(unique);
+JSON.stringify(notifications.filter(n => { if(seen.has(n.jobId)) return false; seen.add(n.jobId); return true; }));
 ```
 
-### A3 — Filtrage nominatif
+### A3 — Filtrage
 
-**TYPE 1 — Alerte générique** → texte contient "Neue Jobangebote" (pluriel) → **SKIP immédiat**
-**TYPE 2 — Offre nominative** → texte contient entreprise + "Neues Jobangebot" (singulier) → **traiter**
+- "Neue Jobangebote" (pluriel) → SKIP
+- "Neues Jobangebot" (singulier) + entreprise → traiter
 
-⚠️ Ne jamais naviguer vers linkedin.com/jobs/search/ — rester sur /notifications/
+⚠️ Ne jamais naviguer vers linkedin.com/jobs/search/
 
-### A4 — Vérification du type d'offre (1 appel par offre nominative)
-
-Pour chaque offre nominative, **un seul `browser_batch`** :
+### A4 — Type d'offre (1 browser_batch par offre)
 
 ```
-browser_batch([
-  navigate(url="https://www.linkedin.com/jobs/view/[jobId]/"),
-  wait(2s)
-])
+browser_batch([navigate(url="https://www.linkedin.com/jobs/view/[jobId]/"), wait(2s)])
 ```
-
-Puis JS combiné (titre + entreprise + type bouton) :
 
 ```javascript
 const btn = document.querySelector('.jobs-apply-button');
 const btnText = btn?.innerText?.trim() || '';
 const hasExternalIcon = !!btn?.querySelector('[data-test-icon="link-external-small"]');
-const isExternal = hasExternalIcon
-  || !!document.querySelector('.jobs-apply-button--external')
-  || btnText.includes('↗');
+const isExternal = hasExternalIcon || !!document.querySelector('.jobs-apply-button--external') || btnText.includes('↗');
 const isEasyApply = !isExternal && (btnText.includes('Einfach bewerben') || btnText.includes('Easy Apply'));
 const title = document.querySelector('.job-details-jobs-unified-top-card__job-title, h1')?.innerText?.trim() || '';
 const company = document.querySelector('.job-details-jobs-unified-top-card__company-name, .topcard__org-name-link')?.innerText?.trim() || '';
-const descEl = document.querySelector('.jobs-description, .job-view-layout');
-const desc = descEl?.innerText?.slice(0, 800) || '';
+const desc = document.querySelector('.jobs-description, .job-view-layout')?.innerText?.slice(0, 800) || '';
 JSON.stringify({ isEasyApply, isExternal, title, company, desc });
 ```
 
-**ROUTAGE :**
-
-| Type détecté | Action |
+| Type | Action |
 |---|---|
-| `isEasyApply = true` | → **Phase C directement** (CV LinkedIn actif, sans customisation) |
-| `isExternal = true` | → **Phase B** (analyse + docs) **puis Phase C** (soumission manuelle) |
+| `isEasyApply` | → Phase C directement |
+| `isExternal` | → Phase B puis Phase C |
 
-### A5 — Boucle de traitement séquentiel
+### A5 — Boucle séquentielle
 
-**RÈGLE FONDAMENTALE : traiter les offres UNE PAR UNE, dans l'ordre.**
-Ne jamais charger toute la liste d'un coup — cela dépasse la capacité de la session.
+Traiter UNE offre à la fois. Pour chaque Easy Apply : Phase C complète → attendre 30s → suivante.
+Les non Easy Apply : lister dans le résumé, traiter manuellement via Phase B.
 
-**Pour chaque offre Easy Apply détectée :**
-1. Exécuter Phase C complètement pour cette offre (soumission + Google Sheets)
-2. Attendre 30 secondes minimum
-3. Passer à l'offre Easy Apply suivante
-4. Répéter jusqu'à épuisement de la liste
-
-**Aucune intervention de Thierry requise entre les offres Easy Apply.**
-
-**Pour les offres non Easy Apply :** ne pas traiter dans cette session. Les lister dans le résumé final pour traitement manuel via Phase B.
-
-### A6 — Résumé Phase A
-
-Afficher en fin de session :
+### A6 — Résumé
 
 ```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ PHASE A TERMINÉE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-EASY APPLY (traitées automatiquement) :
-  • [jobId] — [Entreprise] — [Titre] — STATUT
-
-NON EASY APPLY (à traiter manuellement) :
-  • [jobId] — [Entreprise] — [Titre]
-    → Ouvre une nouvelle conversation et tape :
-       /candidatures-linkedin phase-b [jobId]
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EASY APPLY soumises : [jobId] — [Entreprise] — [Titre] — STATUT
+NON EASY APPLY : /candidatures-linkedin phase-b [jobId]
 ```
 
 ---
 
-## PHASE B — Analyse CV + génération documents (offres NON Easy Apply uniquement)
+## PHASE B — Analyse + génération documents
 
-**⚠️ NOUVELLE SESSION OBLIGATOIRE — ouvre une nouvelle conversation avant de lancer Phase B.**
-**⚠️ Phase B ne s'applique QU'AUX offres non Easy Apply (ATS externe).**
+⚠️ Nouvelle session. Non Easy Apply uniquement.
 
-**Déclencheur : `/candidatures-linkedin phase-b [jobId]`**
-
-### B1 — Récupérer la description complète (2 appels)
+### B1 — Récupérer l'offre
 
 ```
 tabs_context_mcp(createIfEmpty=true)
+browser_batch([navigate(url="https://www.linkedin.com/jobs/view/[jobId]/"), wait(3s)])
 ```
 
-Puis :
-```
-browser_batch([
-  navigate(url="https://www.linkedin.com/jobs/view/[jobId]/"),
-  wait(3s)
-])
-```
+Puis `get_page_text`.
 
-Puis : `get_page_text` pour récupérer la description complète.
+### B2 — Analyse et génération
 
-### B2 — Analyse et génération (zéro appel browser supplémentaire)
-
-Le prompt système du Project prend le relais et exécute :
-- Étape 1 : Analyse du poste
-- Étape 2 : Scoring CV vs poste + vérification interactive des must-have manquants
-- Étape 3 : Optimisation honnête
-- Étape 4 : Verdict + génération CV adapté (PDF) + lettre de motivation (PDF)
-
-Les fichiers sont disponibles en téléchargement dans la réponse.
-
-Noter le bloc `===DECISION===` pour Phase C si soumission manuelle souhaitée ensuite.
+Le prompt système du Project exécute : Étape 1 (analyse poste) → Étape 2 (scoring + must-have) → Étape 3 (optimisation) → **ATS** → Étape 4 (verdict + PDF).
 
 ---
 
-## GÉNÉRATION CV — PROTOCOLE OBLIGATOIRE (Phase B, Étape 4)
+## OPTIMISATION ATS — OBLIGATOIRE avant génération CV
 
-### Fichier source
+### ATS-1 — Extraire les termes cibles
 
-Le CV est généré via `/mnt/project/generate_cv.py` (copie de travail dans `/home/claude/`).
-**Ne jamais écrire un script from scratch.** Toujours partir de ce fichier.
+**Liste A — must-match (présence obligatoire) :**
+- Intitulés de poste exacts
+- Technologies nommées (SAP, Salesforce, Azure…)
+- Frameworks/certifications explicites (ITIL, NIS2, SOX, ISO 27001…)
+- Mots-clés domaine discriminants
+
+**Liste B — secondaires (présence souhaitable) :**
+- Synonymes proches non encore présents
+- Verbes d'action de l'offre
+
+### ATS-2 — Mapping terme par terme
+
+Pour chaque terme Liste A : vérifier présence **mot-à-mot** dans le CV adapté.
+
+**Substituer si :** terme offre = exactement ce que Thierry a fait → remplacer le terme CV par le terme offre.
+**Ne pas substituer si :** terme plus précis que l'expérience réelle (risque entretien) ou version différente (ex. SAP R/3 ≠ SAP S/4HANA).
+
+Exemples autorisés : "vendor steering" → "Vendor Management" · "IT strategic roadmap" → "IT-Strategie & Roadmap"
+Exemples interdits : inventer "DevOps", substituer "SAP R/3" par "SAP S/4HANA"
+
+### ATS-3 — Densité et placement
+
+- Chaque terme Liste A : présent **au moins 1x** dans les bullets des 2-3 postes les plus pertinents
+- `tagline` : contient les 2-3 termes les plus discriminants
+- `expertise` + `competencies` sidebar : termes **exacts** de l'offre, pas paraphrases
+- `profile` sidebar : minimum 2 termes Liste A
+- Cible densité : chaque terme Liste A présent **2-3x** au total (tagline + sidebar + bullets)
+- Ne pas forcer si contexte inadapté — keyword stuffing détecté par certains ATS
+
+### ATS-4 — Vérification finale
+
+Produire ce tableau avant génération PDF :
+
+```
+Terme offre          | Occurrences | Statut
+[terme 1]            | 3           | ✅
+[terme 2]            | 1           | ⚠️ cible 2+
+[terme 3]            | 0           | ❌ MANQUANT
+Score ATS : X/Y termes Liste A couverts
+```
+
+- Terme Liste A à 0 + substitution défendable → insérer avant génération
+- Terme Liste A à 0 + non défendable → noter dans `===NOTES_ADAPTATION===`
+
+---
+
+## GÉNÉRATION CV — PROTOCOLE OBLIGATOIRE
 
 ```bash
 cp /mnt/project/generate_cv.py /home/claude/generate_cv_[ENTREPRISE].py
 ```
 
-### Architecture du script
+### Priorités bullets
 
-Le script expose :
-- `CVData` — structure de données (tagline, profile, expertise, competencies, jobs, education)
-- `JobEntry` / `JobSection` / `BulletItem(text, priority)` — données par poste
-- `auto_calibrate(data)` — ajuste le contenu pour tenir en 2 pages exactes
-- `build_pdf(data, output_path)` — génère le PDF
-- `VARIANTS` — dict de variantes pré-définies (BASE, HASCO, …)
+- **p=1** — jamais retiré (chiffre d'impact, compétence centrale)
+- **p=2** — retiré en dernier recours
+- **p=3** — retiré en premier si > 2 pages
 
-### Règle de priorité des bullets
+`auto_calibrate` retire p=3 de la fin, puis p=2 si nécessaire. Minimum 1 bullet par poste.
 
-Chaque bullet porte une priorité 1/2/3 :
-- **1 = must-keep** — jamais retiré (chiffre d'impact, compétence centrale pour le poste)
-- **2 = important** — retiré en dernier recours seulement
-- **3 = nice-to-have** — retiré en premier si le contenu dépasse 2 pages
+### Workflow variante
 
-L'`auto_calibrate` retire les p=3 en partant de la fin, puis les p=2 si nécessaire.
-**Règle absolue : minimum 1 bullet par poste, jamais de poste supprimé.**
-
-### Workflow de création d'une variante
-
-1. **Copier** le script source dans `/home/claude/`
-2. **Créer** un `CVData` variant en appelant `_make_variant(...)` :
-   - Définir `tagline`, `profile`, `expertise`, `competencies` ciblés sur l'offre
-   - Définir `job_overrides` : dict `{index: JobEntry}` pour les postes à réécrire
-   - Définir `job_order` : liste d'indices pour réordonner selon la pertinence
-   - Les postes les plus pertinents pour l'offre viennent **en premier**
-3. **Appeler** `build_pdf(variant_data, output_path)` — l'auto-calibration s'exécute automatiquement
-4. **Vérifier** le nombre de pages avec `pypdf` :
+1. Copier le script
+2. Définir `CVData` avec `tagline`, `profile`, `expertise`, `competencies`, `job_overrides`, `job_order`
+3. `build_pdf(variant_data, output_path)` — auto-calibration incluse
+4. Vérifier pages :
 
 ```python
 from pypdf import PdfReader
-r = PdfReader(output_path)
-assert len(r.pages) == 2, f"ERREUR : {len(r.pages)} pages générées"
+assert len(PdfReader(output_path).pages) == 2
 ```
 
-5. Si assertion échoue → **ne pas livrer**. Diagnostiquer avec :
+5. Si échec → diagnostiquer :
 
 ```python
 from generate_cv_[ENTREPRISE] import variant_data, _estimate_height, CONTENT_H
 h = _estimate_height(variant_data)
-print(f"Hauteur estimée : {h:.0f} / {2*CONTENT_H:.0f} pts ({h/(2*CONTENT_H)*100:.1f}%)")
+print(f"{h:.0f} / {2*CONTENT_H:.0f} pts ({h/(2*CONTENT_H)*100:.1f}%)")
 ```
 
-### Règles de contenu des variantes
+### Règles de contenu
 
-**Ce qui change par variante :**
-- `tagline` — reformulée pour résonner avec le titre du poste
-- `profile` (sidebar) — 6 lignes max, accent sur les dimensions clés de l'offre
-- `expertise` + `competencies` (sidebar) — réordonnées, termes ATS de l'offre intégrés
-- `job_order` — poste le plus pertinent en position 0
-- `job_overrides` — bullets enrichis / reformulés pour les 2-3 postes les plus pertinents
+**Change par variante :** tagline · profile · expertise · competencies · job_order · job_overrides (bullets 2-3 postes clés)
+**Ne change jamais :** employeurs · titres · dates · chiffres · coordonnées · langues · formation · aucun poste supprimé
 
-**Ce qui ne change jamais :**
-- Noms d'employeurs, intitulés de postes, dates, chiffres (budgets, %)
-- Coordonnées, langues, formation
-- Aucun poste n'est supprimé (continuité chronologique pour les ATS)
+**Détail par pertinence :**
+- Poste central → 6-8 bullets, 2-3 sous-sections
+- Partiellement pertinent → 3-5 bullets, 1-2 sous-sections
+- Non pertinent → 2-3 bullets p=1, pas de sous-section
 
-**Niveaux de détail par pertinence :**
-- Poste central pour l'offre → 6-8 bullets répartis en 2-3 sous-sections
-- Poste partiellement pertinent → 3-5 bullets, 1-2 sous-sections
-- Poste non pertinent → 2-3 bullets priority=1 seulement, pas de sous-section
-
-### Calibration manuelle si auto_calibrate insuffisant
-
-Si après `auto_calibrate` le CV fait encore 3 pages :
-1. Identifier les postes en page 2 avec le plus de bullets p=3
-2. Réduire manuellement à 2 bullets les postes les moins pertinents
-3. Ne jamais toucher aux bullets p=1 des postes centraux
-
-Si le CV fait 2 pages mais page 2 < 50% remplie :
-→ Acceptable si le contenu est dense en page 1 (sous-sections, bullets longs)
-→ Ne pas ajouter du contenu inventé pour "remplir"
-
----
+**Si 3 pages après auto_calibrate :** réduire à 2 bullets les postes les moins pertinents, ne jamais toucher aux p=1 centraux.
+**Si page 2 < 50% :** acceptable si page 1 dense — ne pas inventer du contenu.
 
 ### B3 — Fin de phase
 
 ```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ✅ PHASE B TERMINÉE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Télécharge les fichiers ci-dessus, puis ouvre une NOUVELLE conversation et tape :
-
+→ Télécharge les fichiers, puis nouvelle conversation :
   /candidatures-linkedin phase-c [jobId]
-
-⚠️ Prérequis : CV et lettre téléchargés localement avant de lancer Phase C.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ CV et lettre téléchargés localement avant Phase C.
 ```
 
 ---
 
 ## PHASE C — Soumission + Google Sheets
 
-**⚠️ NOUVELLE SESSION OBLIGATOIRE si appelée manuellement après Phase B.**
-**Quand appelée depuis Phase A (flux Easy Apply) : s'exécute dans la même session.**
+⚠️ Nouvelle session si appelée après Phase B. Même session si venant de Phase A.
 
-**Déclencheurs :**
-- Automatique depuis Phase A pour chaque offre **Easy Apply**
-- Manuel : `/candidatures-linkedin phase-c [jobId]` après Phase B pour offres **non Easy Apply**
+### C1 — Décision
 
-### C1 — Agir selon le type d'offre et le verdict
+- Easy Apply (Phase A) → soumettre directement, aller C2
+- Non Easy Apply : POSTULE → C2 · POSTULE_SI → C3 (EN_ATTENTE_VALIDATION) · NE_POSTULE_PAS → C3 (SKIPPED)
 
-**Flux Easy Apply (venant de Phase A) :**
-→ Pas de verdict Phase B. Soumettre directement avec le CV actif LinkedIn. Aller en C2.
+### C2 — Soumission
 
-**Flux non Easy Apply (venant de Phase B) :**
-- Si VERDICT = NE_POSTULE_PAS → Ne rien soumettre. Aller directement à C3 (STATUT = SKIPPED).
-- Si VERDICT = POSTULE_SI → Ne pas soumettre. Aller directement à C3 (STATUT = EN_ATTENTE_VALIDATION).
-- Si VERDICT = POSTULE → Continuer vers C2.
+Si appelée manuellement : `tabs_context_mcp` puis `browser_batch([navigate jobs/view/[jobId]/], wait(2s))`.
 
-### C2 — Soumission Easy Apply
+Cliquer "Einfach bewerben" / "Easy Apply". Parcourir le formulaire :
+- Contact : vérifier nom/email/tél pré-remplis, ne pas modifier, "Weiter"
+- CV : Easy Apply → CV récent LinkedIn existant · Non Easy Apply → uploader `CV_Formentini_[poste].pdf`
+- Questions sensibles (salaire, disponibilité) → demander confirmation à Thierry
 
-La page du job est déjà chargée si on vient de Phase A.
-Si appelée manuellement :
+**Easy Apply :** soumettre sans confirmation. Afficher `✅ Soumis : [Entreprise] — [Poste] — [CV]`
 
-```
-tabs_context_mcp(createIfEmpty=true)
-```
+**Non Easy Apply :** demander confirmation explicite avant "Absenden". Attendre "oui" / "confirme".
 
-Puis :
+CAPTCHA → arrêt immédiat, alerter Thierry. Erreur technique → STATUT = ERREUR, continuer.
+
+### C3 — Google Sheets
 
 ```
-browser_batch([
-  navigate(url="https://www.linkedin.com/jobs/view/[jobId]/"),
-  wait(2s)
-])
+browser_batch([navigate(url="https://docs.google.com/spreadsheets/d/1ezsbGvCNcg15NDTTCFNVwaWzUW86b9WuJ5GQRu7PmwE/edit"), wait(3s)])
 ```
 
-**Cliquer sur "Einfach bewerben" / "Easy Apply".**
+Ajouter ligne : DATE · ENTREPRISE · POSTE · VERDICT · SCORE_ATS · SCORE_HUMAIN · RAISON_COURTE · STATUT · NOTES
 
-Parcourir le formulaire étape par étape :
+Easy Apply : VERDICT/SCORES = N/A. Non Easy Apply : valeurs du bloc `===DECISION===`.
 
-**Étape Contact :**
-- Vérifier que le nom, email et téléphone sont corrects (pré-remplis par LinkedIn)
-- Ne rien modifier — utiliser les données LinkedIn existantes
-- Cliquer "Weiter"
+### C4 — Résumé
 
-**Étape CV (Resume) :**
-- **Flux Easy Apply (Phase A)** : sélectionner le CV le plus récent déjà présent dans LinkedIn — ne pas uploader de nouveau fichier
-- **Flux non Easy Apply (Phase B→C)** : uploader le CV adapté généré → `CV_Formentini_[poste].pdf`
-
-**Étapes suivantes :**
-- Répondre aux questions additionnelles si présentes
-- Pour les questions sensibles (salaire, disponibilité) : demander confirmation à Thierry avant de répondre
-- Ne jamais renseigner de données financières ou de mots de passe
-
-**Avant la soumission finale :**
-
-**Flux Easy Apply (venant de Phase A) :** soumettre directement sans demander confirmation. Afficher simplement :
-```
-✅ Soumis : [Entreprise] — [Poste] — CV : [nom du CV]
-```
-
-**Flux non Easy Apply (venant de Phase B) :** demander confirmation explicite :
-```
-Prêt à soumettre :
-  Entreprise : [ENTREPRISE]
-  Poste      : [POSTE]
-  CV utilisé : [nom du CV uploadé]
-  Email      : [email affiché]
-
-Confirmes-tu la soumission ?
-```
-Attendre "oui" ou "confirme" explicite avant de cliquer "Absenden" / "Submit".
-
-Cliquer "Absenden" / "Submit" → STATUT = SOUMIS.
-
-**En cas de CAPTCHA :** s'arrêter immédiatement, alerter Thierry, STATUT = ERREUR_CAPTCHA.
-**En cas d'erreur technique :** STATUT = ERREUR + description, continuer avec l'offre suivante.
-
-### C3 — Mise à jour Google Sheets (1 appel)
-
-```
-browser_batch([
-  navigate(url="https://docs.google.com/spreadsheets/d/1ezsbGvCNcg15NDTTCFNVwaWzUW86b9WuJ5GQRu7PmwE/edit"),
-  wait(3s)
-])
-```
-
-Ajouter une ligne sur la première ligne vide :
-
-| DATE | ENTREPRISE | POSTE | VERDICT | SCORE_ATS | SCORE_HUMAIN | RAISON_COURTE | STATUT | NOTES |
-
-- **Flux Easy Apply** : VERDICT = N/A · SCORE_ATS = N/A · SCORE_HUMAIN = N/A · STATUT = SOUMIS (ou ERREUR)
-- **Flux non Easy Apply** : remplir avec les valeurs du bloc `===DECISION===` de Phase B
-
-Sauvegarder.
-
-### C4 — Résumé final
-
-Afficher :
-- Offres soumises (SOUMIS)
-- Offres en attente (EN_ATTENTE_VALIDATION)
-- Offres skippées (SKIPPED)
-- Erreurs (ERREUR)
-
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ PHASE C TERMINÉE — Session complète clôturée.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
+Lister : SOUMIS · EN_ATTENTE_VALIDATION · SKIPPED · ERREUR → `✅ PHASE C TERMINÉE`
 
 ---
 
-## RÈGLES DE SÉCURITÉ (toutes phases)
+## RÈGLES DE SÉCURITÉ
 
-- **Easy Apply (flux automatique)** : soumission sans confirmation — full automatique
-- **Non Easy Apply (flux manuel)** : ne jamais soumettre sans confirmation explicite de Thierry
-- Ne jamais remplir de champs financiers, mots de passe ou données sensibles
-- Si CAPTCHA → s'arrêter et alerter immédiatement
-- Maximum 10 offres par session Phase A
-- Attendre minimum 30 secondes entre deux soumissions successives en Phase C
-- En cas d'erreur → STATUT = ERREUR + description → continuer avec l'offre suivante
+- Easy Apply : soumission automatique sans confirmation
+- Non Easy Apply : confirmation explicite obligatoire avant soumission
+- Jamais de données financières, mots de passe
+- CAPTCHA → arrêt immédiat
+- Max 10 offres par session Phase A
+- 30s minimum entre deux soumissions Phase C
+- Erreur → STATUT = ERREUR + description → offre suivante
